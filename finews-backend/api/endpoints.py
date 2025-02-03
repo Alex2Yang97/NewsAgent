@@ -1,18 +1,20 @@
+import json
+from loguru import logger
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from typing import List, Optional
 from pydantic import BaseModel
+
+from langchain_core.messages.base import BaseMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
 from db.database import get_db
-from models.models import User, Conversation, Message
-from api.auth import get_current_user, get_password_hash, create_access_token
+from models.models import User, Conversation, ChatHistory, News
 from agents.news_agent import NewsAnalystAgent
+from utils.fake_user import get_user_by_id
 
 router = APIRouter()
-
-class UserCreate(BaseModel):
-    username: str
-    email: str
-    password: str
 
 class ConversationCreate(BaseModel):
     title: str
@@ -20,80 +22,208 @@ class ConversationCreate(BaseModel):
 class MessageCreate(BaseModel):
     content: str
 
-@router.post("/users/", response_model=dict)
-def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = User(
-        username=user.username,
-        email=user.email,
-        password_hash=get_password_hash(user.password)
-    )
-    db.add(db_user)
-    db.commit()
+
+def msg_to_json(msg_lst: list[BaseMessage]):
+    msg_json_lst = []
+
+    for msg in msg_lst:
+        if isinstance(msg, ToolMessage):
+            msg_json_lst.append({"tool": msg.model_dump_json()})
+        elif isinstance(msg, AIMessage):
+            msg_json_lst.append({"ai": msg.model_dump_json()})
+        elif isinstance(msg, HumanMessage):
+            msg_json_lst.append({"human": msg.model_dump_json()})
+        elif isinstance(msg, SystemMessage):
+            msg_json_lst.append({"system": msg.model_dump_json()})
+        else:
+            raise ValueError(f"Unknown message type: {type(msg)}")
+
+    return msg_json_lst
+
+
+def msg_from_json(msg_json_lst: list[dict]):
+    msg_lst = []
+    print(f"alex-debug msg_json_lst: {msg_json_lst}")
+    for msg_json in msg_json_lst:
+        print(f"alex-debug msg_json: {msg_json}")
+        if "tool" in msg_json:
+            msg_lst.append(ToolMessage(**json.loads(msg_json["tool"])))
+        elif "ai" in msg_json:
+            msg_lst.append(AIMessage(**json.loads(msg_json["ai"])))
+        elif "human" in msg_json:
+            msg_lst.append(HumanMessage(**json.loads(msg_json["human"])))
+        elif "system" in msg_json:
+            msg_lst.append(SystemMessage(**json.loads(msg_json["system"])))
+        else:
+            raise ValueError(f"Unknown message type: {msg_json}")
+
+    return msg_lst
+
+
+@router.get("/conversations/{thread_id}/messages")
+async def retrieve_conversation(
+    thread_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    # Use fake user
+    current_user = await get_user_by_id(1)
     
-    access_token = create_access_token(data={"sub": user.username})
-    return {"access_token": access_token, "token_type": "bearer"}
-
-@router.post("/conversations/")
-def create_conversation(
-    conv: ConversationCreate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    conversation = Conversation(user_id=current_user.id, title=conv.title)
-    db.add(conversation)
-    db.commit()
-    return conversation
-
-@router.post("/conversations/{conversation_id}/messages/")
-def create_message(
-    conversation_id: int,
-    message: MessageCreate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    # Verify conversation belongs to user
-    conversation = db.query(Conversation).filter(
-        Conversation.id == conversation_id,
+    # Verify conversation exists and belongs to user
+    stmt = select(Conversation).where(
+        Conversation.thread_id == thread_id,
         Conversation.user_id == current_user.id
-    ).first()
+    )
+    result = await db.execute(stmt)
+    conversation = result.scalar_one_or_none()
     
     if not conversation:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+        raise HTTPException(
+            status_code=404, 
+            detail="Conversation not found or you don't have access"
+        )
     
+    # Get chat history
+    stmt = select(ChatHistory).where(
+        ChatHistory.thread_id == thread_id
+    ).order_by(ChatHistory.created_at.asc())
+    result = await db.execute(stmt)
+    msg_lst = []
+    for row in result.scalars().all():
+        msg_lst.extend(msg_from_json(row.content))
+    return msg_lst
+
+
+@router.post("/chat")
+async def chat_news_agent(
+    message: MessageCreate,
+    thread_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    # Use fake user
+    current_user = await get_user_by_id()
+    
+    conversation = None
+    
+    logger.debug(f"alex-debug thread_id: {thread_id}")
+    if thread_id:
+        # Verify conversation exists and belongs to user
+        stmt = select(Conversation).where(
+            Conversation.thread_id == thread_id,
+            Conversation.user_id == current_user.id
+        )
+        result = await db.execute(stmt)
+        conversation = result.scalar_one_or_none()
+        
+        if not conversation:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found or you don't have access"
+            )
+            
+        # Extract messages from ChatHistory based on conversation.thread_id
+        stmt = select(ChatHistory).where(
+            ChatHistory.thread_id == conversation.thread_id
+        ).order_by(ChatHistory.created_at.asc())
+        result = await db.execute(stmt)
+        chat_history = []
+        for row in result.scalars().all():
+            chat_history.extend(row.content)
+        
+        # Convert chat history to list of messages
+        chat_history_msg_lst = msg_from_json(chat_history)
+        
+    else:
+        chat_history_msg_lst = []
+    
+    logger.debug(f"alex-debug chat_history_msg_lst: {chat_history_msg_lst}")
     # Create news analyst agent
-    agent = NewsAnalystAgent(db=db)
+    agent = NewsAnalystAgent()
+    
+    msg_lst = chat_history_msg_lst + [HumanMessage(content=message.content)]
     
     # Process message and get response
-    result = agent.run(message.content, conversation_id)
+    result = await agent.arun(msg_lst)
+    result["messages"] = result["messages"][len(chat_history_msg_lst):]
     
-    return {
-        "conversation_id": conversation_id,
-        "response": result["messages"][-1].content
-    }
-
-@router.get("/conversations/")
-def list_conversations(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    return db.query(Conversation).filter(
-        Conversation.user_id == current_user.id
-    ).all()
-
-@router.get("/conversations/{conversation_id}/messages/")
-def list_messages(
-    conversation_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    conversation = db.query(Conversation).filter(
-        Conversation.id == conversation_id,
-        Conversation.user_id == current_user.id
-    ).first()
+    logger.debug(f"alex-debug result: {result}")
     
     if not conversation:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+        logger.debug(f"alex-debug create new conversation")
+        # Create new conversation
+        conversation = Conversation(
+            user_id=current_user.id,
+            title=message.content,
+            thread_id=agent.thread_id
+        )
+        
+        db.add(conversation)
     
-    return db.query(Message).filter(
-        Message.conversation_id == conversation_id
-    ).order_by(Message.created_at.asc()).all() 
+    logger.debug(f"alex-debug create chat history")
+    conversation_to_db = msg_to_json(result["messages"])
+    user_message = ChatHistory(
+        thread_id=conversation.thread_id,
+        content=conversation_to_db
+    )
+    db.add(user_message)
+    
+    await db.commit()
+    await db.refresh(conversation)
+    await db.refresh(user_message)
+    
+    # Store news items if present in metadata
+    if "news" in result["metadata"]:
+        logger.debug(f"alex-debug store news items")
+        try:
+            news_content_to_db = []
+            for news_item in result["metadata"]["news"]:
+                news_content_to_db.append({
+                    "title": news_item.get("title", None),
+                    "description": news_item.get("description", None),
+                    "content": news_item.get("content", None),
+                })
+                news = News(
+                    thread_id=conversation.thread_id,
+                    content=news_content_to_db,
+                    link=news_item.get("link", None),
+                    query=news_item.get("query", None),
+                    source=news_item.get("source", None)
+                )
+                db.add(news)
+                await db.commit()
+        except Exception as e:
+            logger.error(f"Error processing news items: {e}")
+
+
+    return {
+        "thread_id": conversation.thread_id,
+        "response": result
+    }
+
+@router.get("/conversations/{thread_id}/news")
+async def retrieve_news(
+    thread_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    # Use fake user
+    current_user = await get_user_by_id()
+    
+    # Verify conversation exists and belongs to user
+    stmt = select(Conversation).where(
+        Conversation.thread_id == thread_id,
+        Conversation.user_id == current_user.id
+    )
+    result = await db.execute(stmt)
+    conversation = result.scalar_one_or_none()
+    
+    if not conversation:
+        raise HTTPException(
+            status_code=404,
+            detail="Conversation not found or you don't have access"
+        )
+    
+    # Get news related to the conversation
+    stmt = select(News).where(
+        News.thread_id == conversation.thread_id
+    ).order_by(News.created_at.desc())
+    result = await db.execute(stmt)
+    return result.scalars().all()

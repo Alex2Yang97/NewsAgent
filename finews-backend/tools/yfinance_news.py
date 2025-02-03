@@ -70,7 +70,6 @@ class YahooFinanceNewsTool(BaseTool):  # type: ignore[override, override]
         if not result:
             logger.warning(f"yfinance_news: No news found for {entity}.")
             return []
-        print(f"alex-debug yfinance: {result}")
         return result
 
     @staticmethod
@@ -83,6 +82,7 @@ class YahooFinanceNewsTool(BaseTool):  # type: ignore[override, override]
                     "description": doc.metadata["description"],
                     "content": doc.page_content,
                     "link": doc.metadata["source"],
+                    "query": entity,
                     "source": "yfinance",
                 })
         return formatted_docs

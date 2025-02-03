@@ -78,13 +78,14 @@ class DuckDuckGoSearchResults(BaseTool):  # type: ignore[override, override]
             "description": d["snippet"],
             "content": None,
             "link": d["link"],
+            "query": query,
             "source": "ddg",
         } for d in filtered_results]
         print(f"alex-debug ddg: {formatted_results}")
         return formatted_results
 
     @staticmethod
-    def _format_results(docs: Iterable[Document]) -> list[dict]:
+    def _format_results(docs: Iterable[Document], query: str) -> list[dict]:
         formatted_docs = []
         for doc in docs:
             formatted_docs.append({ 
@@ -92,6 +93,7 @@ class DuckDuckGoSearchResults(BaseTool):  # type: ignore[override, override]
                 "description": doc.metadata["description"],
                 "content": doc.page_content,
                 "link": doc.metadata["source"],
+                "query": query,
                 "source": "ddg",
             })
         return formatted_docs

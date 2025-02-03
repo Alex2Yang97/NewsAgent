@@ -6,6 +6,7 @@ from functools import partial
 from itertools import chain
 from typing import Annotated, List, Set
 
+from langchain_core.messages.base import BaseMessage
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
@@ -27,14 +28,15 @@ def news_retriever(
 
 
 class NewsAnalystAgent:
-    def __init__(self, model_name: ModelName = ModelName.GPT_4_O_MINI, tracing: bool = False):
+    def __init__(self, model_name: ModelName = ModelName.LLAMA_3_2, tracing: bool = False):
         logger.info("Initializing NewsAnalystAgent")
         self.tools = [news_retriever]
         self.model = get_llm(model_name, self.tools)
+        self.thread_id = str(uuid4())
         if tracing:
             self.config = {
                 "configurable": {
-                    "thread_id": str(uuid4())
+                    "thread_id": self.thread_id
                 }
             }
         else:
@@ -137,14 +139,27 @@ class NewsAnalystAgent:
         logger.info("News analyst agent workflow created successfully")
         return workflow.compile()
     
-    def run(self, query: str):
+    def run(self, msg_lst: list[BaseMessage]):
         """Run the news analyst agent"""
         agent = self.create_agent()
         res = agent.invoke(
             input={
-                "messages": [HumanMessage(content=query)],
+                "messages": msg_lst,
                 "metadata": {}
             },
             config=self.config
         )
         return res
+    
+    async def arun(self, msg_lst: list[BaseMessage]):
+        """Run the news analyst agent asynchronously"""
+        agent = self.create_agent()
+        res = await agent.ainvoke(
+            input={
+                "messages": msg_lst,
+                "metadata": {}
+            },
+            config=self.config
+        )
+        return res
+    

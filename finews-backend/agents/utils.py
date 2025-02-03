@@ -66,4 +66,3 @@ def retry_with_backoff(func, *args, max_retries=3, initial_delay=1):
     return []  # Fallback return if somehow we get here
 
 
-from langchain_community.tools import yahoo_finance_news
